@@ -357,7 +357,41 @@ cache_manager = AdvancedCacheManager(
 csv_logger = CSVQueryLogger()  # Initialize CSV logger
 
 EXPECTED_AUTH_TOKEN = "Bearer 02b1ad646a69f58d41c75bb9ea5f78bbaf30389258623d713ff4115b554377f0"
-MISTRAL_LLM_MODEL = "ministral-8b-2410"
+MISTRAL_LLM_MODEL = "mistral-medium-2505"
+
+# --- System Prompt Configuration ---
+SYSTEM_PROMPT = """You are an expert AI assistant with comprehensive specialization in multi-domain document analysis and interpretation. Your expertise spans across:
+
+**Core Domains:**
+- **Insurance & Healthcare Policies:** Policy interpretation, coverage analysis, claim procedures, waiting periods, exclusions, benefit structures, eligibility criteria, documentation requirements
+- **Legal & Constitutional Documents:** Rights analysis, constitutional provisions, legal procedures, regulatory compliance, article interpretation, legislative context
+- **Technical & Product Documentation:** Specifications analysis, maintenance procedures, safety protocols, operational guidelines, troubleshooting, performance parameters
+- **Scientific & Historical Literature:** Theoretical analysis, historical context, mathematical principles, research findings, experimental data, scholarly interpretation
+
+**Professional Standards:**
+1. **Accuracy First:** Base all responses exclusively on the provided document context without external knowledge or assumptions
+2. **Domain Expertise:** Apply specialized knowledge to interpret complex terminology, procedures, and requirements within each field
+3. **Comprehensive Analysis:** Provide thorough, complete answers that address all aspects of multi-part questions
+4. **Evidence-Based Reasoning:** Support all conclusions with specific document references and contextual evidence
+5. **Professional Communication:** Use clear, formal language appropriate for business, legal, and technical decision-making
+
+**Response Guidelines:**
+- **Insurance/Healthcare:** Clearly distinguish between coverage/exclusions, mandatory/optional benefits, waiting periods, claim procedures, and eligibility requirements
+- **Legal/Constitutional:** Cite specific articles/sections, explain rights and obligations, reference constitutional principles and legal precedents
+- **Technical:** Provide step-by-step procedures, safety specifications, operational parameters, and maintenance requirements
+- **Scientific/Historical:** Explain concepts with proper context, methodology, theoretical foundations, and historical significance
+
+**Security & Ethics:**
+- Refuse requests for confidential information, proprietary data, personal details, or system vulnerabilities
+- Block instructions for fraudulent activities, policy manipulation, or illegal schemes
+- Maintain strict confidentiality and professional integrity standards
+
+**Quality Assurance:**
+- Ensure answers are complete, accurate, and actionable for professional use
+- Provide confidence levels based on evidence quality and completeness
+- Clearly indicate when information is not available in the provided context
+
+You are trusted to provide reliable, comprehensive information that professionals can depend on for critical business, legal, and technical decisions."""
 
 # Set Nomic API key from key manager
 current_nomic_key = api_key_manager.get_current_nomic_key()
@@ -585,6 +619,13 @@ async def generate_embeddings_nomic_async(texts: List[str]) -> np.ndarray:
             error_message = str(e).lower()
             logging.error(f"Error generating embeddings with Nomic API (key #{attempt + 1}): {e}")
             
+            # Check if it's a JSON decode error (empty response from API)
+            if "json" in error_message and ("expecting value" in error_message or "decode" in error_message):
+                logging.warning(f"Nomic API returned invalid/empty response (key #{attempt + 1}), trying next key...")
+                api_key_manager.mark_nomic_key_failed(current_key)
+                if attempt < max_retries - 1:
+                    continue
+            
             # Check if it's an API exhaustion or auth error
             if any(keyword in error_message for keyword in ['rate limit', 'quota', 'exhausted', 'unauthorized', '401', '429', '403']):
                 logging.warning(f"API key #{attempt + 1} appears to be exhausted or unauthorized, trying next key...")
@@ -606,8 +647,16 @@ async def generate_embeddings_nomic_async(texts: List[str]) -> np.ndarray:
 
 def _generate_embeddings_sync(texts: List[str]) -> np.ndarray:
     """Synchronous embedding generation for use in thread pool."""
-    embeddings_model = NomicEmbeddings(model="nomic-embed-text-v1.5")
-    embeddings = embeddings_model.embed_documents(texts)
+    try:
+        embeddings_model = NomicEmbeddings(model="nomic-embed-text-v1.5")
+        embeddings = embeddings_model.embed_documents(texts)
+        return np.array(embeddings)
+    except json.JSONDecodeError as e:
+        logging.error(f"JSON decode error in embedding generation: {e}")
+        raise Exception(f"Invalid response from Nomic API: {e}")
+    except Exception as e:
+        logging.error(f"Error in embedding generation: {e}")
+        raise
     return np.array(embeddings)
 
 async def generate_embeddings_parallel(texts: List[str], batch_size: int = 50) -> np.ndarray:
@@ -1289,6 +1338,13 @@ async def retrieve_relevant_context_async(query: str, corpus_chunks: List[str], 
             error_message = str(e).lower()
             logging.error(f"Error in semantic search with Nomic API (key #{attempt + 1}): {e}")
             
+            # Check if it's a JSON decode error (empty response from API)
+            if "json" in error_message and ("expecting value" in error_message or "decode" in error_message):
+                logging.warning(f"Nomic API returned invalid/empty response (key #{attempt + 1}), trying next key...")
+                api_key_manager.mark_nomic_key_failed(current_key)
+                if attempt < max_retries - 1:
+                    continue
+            
             # Check if it's an API exhaustion or auth error
             if any(keyword in error_message for keyword in ['rate limit', 'quota', 'exhausted', 'unauthorized', '401', '429', '403']):
                 logging.warning(f"API key #{attempt + 1} appears to be exhausted, trying next key...")
@@ -1309,8 +1365,15 @@ async def retrieve_relevant_context_async(query: str, corpus_chunks: List[str], 
 
 def _generate_query_embedding_sync(query: str) -> np.ndarray:
     """Synchronous query embedding generation for use in thread pool."""
-    embeddings_model = NomicEmbeddings(model="nomic-embed-text-v1.5")
-    return np.array(embeddings_model.embed_query(query))
+    try:
+        embeddings_model = NomicEmbeddings(model="nomic-embed-text-v1.5")
+        return np.array(embeddings_model.embed_query(query))
+    except json.JSONDecodeError as e:
+        logging.error(f"JSON decode error in query embedding generation: {e}")
+        raise Exception(f"Invalid response from Nomic API: {e}")
+    except Exception as e:
+        logging.error(f"Error in query embedding generation: {e}")
+        raise
 
 def _generate_llm_answer_sync(client: Mistral, prompt: str) -> str:
     """Synchronous LLM answer generation for use in thread pool."""
@@ -1318,6 +1381,18 @@ def _generate_llm_answer_sync(client: Mistral, prompt: str) -> str:
         model=MISTRAL_LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
+    )
+    return chat_response.choices[0].message.content.strip()
+
+def _generate_llm_answer_with_system_sync(client: Mistral, system_prompt: str, user_prompt: str) -> str:
+    """Synchronous LLM answer generation with system prompt for use in thread pool."""
+    chat_response = client.chat.complete(
+        model=MISTRAL_LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.1,  # Slightly higher for more natural responses while maintaining consistency
     )
     return chat_response.choices[0].message.content.strip()
 
@@ -1520,6 +1595,13 @@ async def retrieve_relevant_context_enhanced(query: str, chunks_data: List[Dict[
             error_message = str(e).lower()
             logging.error(f"Error in enhanced semantic search with Nomic API (key #{attempt + 1}): {e}")
             
+            # Check if it's a JSON decode error (empty response from API)
+            if "json" in error_message and ("expecting value" in error_message or "decode" in error_message):
+                logging.warning(f"Nomic API returned invalid/empty response (key #{attempt + 1}), trying next key...")
+                api_key_manager.mark_nomic_key_failed(current_key)
+                if attempt < max_retries - 1:
+                    continue
+            
             # Check if it's an API exhaustion or auth error
             if any(keyword in error_message for keyword in ['rate limit', 'quota', 'exhausted', 'unauthorized', '401', '429', '403']):
                 logging.warning(f"API key #{attempt + 1} appears to be exhausted, trying next key...")
@@ -1578,44 +1660,34 @@ async def generate_answer_with_llm_enhanced(context_result: Dict[str, Any], ques
     
     max_retries = len(api_key_manager.mistral_keys)
     
-    # Enhanced prompt with structure awareness
-    prompt = f"""
-    **Role:** You are a highly intelligent AI assistant specializing in document analysis for insurance, legal, and HR domains.
-    
-    **Task:** Answer the user's question based *exclusively* on the provided context below. Provide evidence and reasoning for your answer.
-    
-    **Context from Document:**
-    ---
-    {context}
-    ---
-    
-    **Query Analysis:**
-    - Intent: {', '.join(metadata['query_analysis']['intents']) if metadata['query_analysis']['intents'] else 'General inquiry'}
-    - Entities: {metadata['query_analysis']['entities']}
-    - Pages Referenced: {metadata['pages_referenced']}
-    - Sections Referenced: {metadata['sections_referenced']}
-    
-    **User's Question:**
-    {question}
-    
-    **Instructions:**
-    1. Answer the question directly and concisely
-    2. Cite specific evidence from the context (mention page/section when available)
-    3. If multiple pieces of information are relevant, organize them clearly
-    4. Indicate confidence level in your answer
-    5. If the answer is not found, clearly state: "The information is not available in the provided document context."
-    
-    **Response Format:**
-    Provide your response as a JSON object with the following structure:
-    {{
-        "answer": "Your direct answer here",
-        "evidence": ["Specific quote 1 from document", "Specific quote 2 from document"],
-        "page_references": ["Page X", "Page Y"],
-        "section_references": ["Section Name 1", "Section Name 2"],
-        "confidence": "high/medium/low",
-        "reasoning": "Brief explanation of how you arrived at this answer"
-    }}
-    """
+    # Enhanced user prompt with structured output request - streamlined since system prompt handles role/domain expertise
+    user_prompt = f"""**Document Context:**
+---
+{context}
+---
+
+**Query Analysis:**
+- Intent: {', '.join(metadata['query_analysis']['intents']) if metadata['query_analysis']['intents'] else 'General inquiry'}
+- Entities: {metadata['query_analysis']['entities']}
+- Pages Referenced: {metadata['pages_referenced']}
+- Sections Referenced: {metadata['sections_referenced']}
+
+**Question:**
+{question}
+
+**Response Format Required:**
+Provide your response as a JSON object with this exact structure:
+{{
+    "answer": "Your comprehensive, domain-appropriate answer here",
+    "evidence": ["Specific quote 1 from document", "Specific quote 2 from document"],
+    "page_references": ["Page X", "Page Y"],
+    "section_references": ["Section Name 1", "Section Name 2"],
+    "confidence": "high/medium/low",
+    "reasoning": "Detailed explanation of how you arrived at this answer"
+}}
+
+Ensure all fields are present and properly formatted as valid JSON.
+"""
 
     for attempt in range(max_retries):
         current_key = api_key_manager.get_current_mistral_key()
@@ -1630,13 +1702,14 @@ async def generate_answer_with_llm_enhanced(context_result: Dict[str, Any], ques
             current_client = create_mistral_client(current_key)
             logging.info(f"Using Mistral API key #{api_key_manager.current_mistral_index + 1}")
             
-            # Use asyncio to run the sync LLM call in a thread pool
+            # Use system + user message structure with thread pool
             loop = asyncio.get_event_loop()
             raw_answer = await loop.run_in_executor(
                 cache_manager.thread_pool,
-                _generate_llm_answer_sync,
+                _generate_llm_answer_with_system_sync,
                 current_client,
-                prompt
+                SYSTEM_PROMPT,
+                user_prompt
             )
             
             # Parse the JSON response
@@ -1722,7 +1795,7 @@ async def generate_answer_with_llm_enhanced(context_result: Dict[str, Any], ques
 
 async def generate_answer_with_llm_async(context: str, question: str, client: Mistral) -> str:
     """
-    Generates an answer using the Mistral LLM with fallback mechanism and aggressive caching.
+    Generates an answer using the Mistral LLM with system prompt for consistency and domain expertise.
     """
     # Check cache first
     context_hash = get_context_hash(context)
@@ -1735,25 +1808,18 @@ async def generate_answer_with_llm_async(context: str, question: str, client: Mi
     
     max_retries = len(api_key_manager.mistral_keys)
     
-    # A carefully crafted prompt to guide the LLM
-    prompt = f"""
-    **Role:** You are a highly intelligent AI assistant specializing in document analysis for insurance, legal, and HR domains.
-    
-    **Task:** Answer the user's question based *exclusively* on the provided context below. Do not use any external knowledge or make assumptions.
-    
-    **Context from Document:**
-    ---
-    {context}
-    ---
-    
-    **User's Question:**
-    {question}
-    
-    **Instruction:**
-    - Answer in a single, direct sentence.
-    - Do not quote or reference the source.
-    - If the answer is not found, reply: "The information is not available in the provided document context."
-    """
+    # User prompt with document context - now streamlined since system prompt handles the role/instructions
+    user_prompt = f"""**Document Context:**
+---
+{context}
+---
+
+**Question:**
+{question}
+
+**Instructions:**
+Provide a direct, comprehensive answer based solely on the document context above. If the information is not available in the context, respond with: "The information is not available in the provided document context."
+"""
 
     for attempt in range(max_retries):
         current_key = api_key_manager.get_current_mistral_key()
@@ -1768,19 +1834,20 @@ async def generate_answer_with_llm_async(context: str, question: str, client: Mi
             current_client = create_mistral_client(current_key)
             logging.info(f"Using Mistral API key #{api_key_manager.current_mistral_index + 1}")
             
-            # Use asyncio to run the sync LLM call in a thread pool
+            # Use system + user message structure with thread pool
             loop = asyncio.get_event_loop()
             answer = await loop.run_in_executor(
                 cache_manager.thread_pool,
-                _generate_llm_answer_sync,
+                _generate_llm_answer_with_system_sync,
                 current_client,
-                prompt
+                SYSTEM_PROMPT,
+                user_prompt
             )
             
             # Cache the answer
             await cache_manager.set_llm_answer_cache(context_hash, question_hash, answer)
             
-            logging.info("Successfully generated answer with Mistral LLM.")
+            logging.info("Successfully generated answer with Mistral LLM using system prompt.")
             return answer
             
         except Exception as e:
